@@ -12,6 +12,7 @@ from memory_store import (
     load_history,
     save_turn,
 )
+from rag_backend import generate_grounded_reply
 
 load_dotenv()
 
@@ -35,10 +36,7 @@ client = discord.Client(
 conversation_locks: dict[tuple[int, int], asyncio.Lock] = {}
 last_request_times: dict[int, float] = {}
 
-# Only one request can enter the AI processing section at a time.
 processing_lock = asyncio.Lock()
-
-# Includes requests being processed and requests waiting.
 pending_requests = 0
 
 
@@ -47,24 +45,30 @@ async def on_ready():
     print(f"Connected to Discord as {client.user}", flush=True)
 
 
-async def answer_question(message, question):
+async def answer_question(message, question, command):
     channel_id = message.channel.id
     user_id = message.author.id
 
     try:
         async with message.channel.typing():
-            history = await asyncio.to_thread(
-                load_history,
-                channel_id,
-                user_id,
-                limit=MAX_HISTORY_MESSAGES,
-            )
+            if command == "!lookup":
+                reply = await asyncio.to_thread(
+                    generate_grounded_reply,
+                    question,
+                )
+            else:
+                history = await asyncio.to_thread(
+                    load_history,
+                    channel_id,
+                    user_id,
+                    limit=MAX_HISTORY_MESSAGES,
+                )
 
-            reply = await asyncio.to_thread(
-                generate_reply,
-                question,
-                history=history,
-            )
+                reply = await asyncio.to_thread(
+                    generate_reply,
+                    question,
+                    history=history,
+                )
 
             reply = (reply or "").strip()
             if not reply:
@@ -73,14 +77,16 @@ async def answer_question(message, question):
                 )
                 return
 
-            await asyncio.to_thread(
-                save_turn,
-                channel_id,
-                user_id,
-                question,
-                reply,
-                limit=MAX_HISTORY_MESSAGES,
-            )
+            # Only general chat is stored in conversation memory.
+            if command == "!ask":
+                await asyncio.to_thread(
+                    save_turn,
+                    channel_id,
+                    user_id,
+                    question,
+                    reply,
+                    limit=MAX_HISTORY_MESSAGES,
+                )
 
     except Exception as error:
         print(
@@ -108,7 +114,7 @@ async def on_message(message: discord.Message):
         return
 
     command = parts[0].lower()
-    if command not in ("!ask", "!reset"):
+    if command not in ("!ask", "!lookup", "!reset"):
         return
 
     channel_id = message.channel.id
@@ -143,9 +149,12 @@ async def on_message(message: discord.Message):
         return
 
     if len(parts) < 2:
-        await message.channel.send(
-            "Try: !ask Explain overfitting in simple terms."
-        )
+        if command == "!lookup":
+            example = "!lookup What does IWAG stand for?"
+        else:
+            example = "!ask Explain overfitting in simple terms."
+
+        await message.channel.send(f"Try: {example}")
         return
 
     question = parts[1]
@@ -168,13 +177,11 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # Reserve a slot before any await lets another handler run.
     requests_ahead = pending_requests
     pending_requests += 1
     last_request_times[user_id] = now
 
     try:
-        # Preserve ordering between questions and resets.
         async with conversation_lock:
             if requests_ahead > 0:
                 await message.channel.send(
@@ -183,7 +190,7 @@ async def on_message(message: discord.Message):
                 )
 
             async with processing_lock:
-                await answer_question(message, question)
+                await answer_question(message, question, command)
 
     except Exception as error:
         print(
@@ -192,7 +199,6 @@ async def on_message(message: discord.Message):
         )
 
     finally:
-        # Release the slot even if processing or sending fails.
         pending_requests -= 1
 
 

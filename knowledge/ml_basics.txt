@@ -1,0 +1,28 @@
+Title: Machine Learning Basics
+Author: NeroAI learning project
+
+## Overfitting
+Overfitting happens when a model learns patterns specific to its
+training data, including noise, and performs poorly on unseen data.
+Ways to reduce it include regularization, simpler models, and
+collecting more representative training data.
+
+## Train, validation, and test sets
+The training set is used to fit the model.
+The validation set is used to select models and tune hyperparameters.
+The test set is reserved for evaluating the final selected model.
+Repeatedly using test results to make modeling decisions can make
+the final evaluation overly optimistic.
+
+## Data leakage
+Data leakage happens when information that would not be available
+at prediction time is used during model development.
+For example, fitting a scaler on the full dataset before splitting
+allows information from the test set to influence preprocessing.
+Fit preprocessing steps on the training set, then apply them to
+the validation and test sets.
+
+## NeroAI project convention
+For this learning project, the baseline experiment is named
+Coconut Baseline.
+This is a project-specific name, not a standard machine learning term.
