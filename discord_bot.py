@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 import discord
 from dotenv import load_dotenv
@@ -20,6 +21,9 @@ if not TOKEN:
 
 initialize_database()
 
+COOLDOWN_SECONDS = 10
+MAX_PENDING_REQUESTS = 5
+
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -28,8 +32,14 @@ client = discord.Client(
     allowed_mentions=discord.AllowedMentions.none(),
 )
 
-# Keep requests from the same user in the same channel in order.
 conversation_locks: dict[tuple[int, int], asyncio.Lock] = {}
+last_request_times: dict[int, float] = {}
+
+# Only one request can enter the AI processing section at a time.
+processing_lock = asyncio.Lock()
+
+# Includes requests being processed and requests waiting.
+pending_requests = 0
 
 
 @client.event
@@ -37,8 +47,59 @@ async def on_ready():
     print(f"Connected to Discord as {client.user}", flush=True)
 
 
+async def answer_question(message, question):
+    channel_id = message.channel.id
+    user_id = message.author.id
+
+    try:
+        async with message.channel.typing():
+            history = await asyncio.to_thread(
+                load_history,
+                channel_id,
+                user_id,
+                limit=MAX_HISTORY_MESSAGES,
+            )
+
+            reply = await asyncio.to_thread(
+                generate_reply,
+                question,
+                history=history,
+            )
+
+            reply = (reply or "").strip()
+            if not reply:
+                await message.channel.send(
+                    "The model returned an empty response."
+                )
+                return
+
+            await asyncio.to_thread(
+                save_turn,
+                channel_id,
+                user_id,
+                question,
+                reply,
+                limit=MAX_HISTORY_MESSAGES,
+            )
+
+    except Exception as error:
+        print(
+            f"Request error: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        await message.channel.send(
+            "Sorry, I couldn't complete your request. Please try again."
+        )
+        return
+
+    for start in range(0, len(reply), 1900):
+        await message.channel.send(reply[start:start + 1900])
+
+
 @client.event
 async def on_message(message: discord.Message):
+    global pending_requests
+
     if message.author.bot:
         return
 
@@ -53,10 +114,12 @@ async def on_message(message: discord.Message):
     channel_id = message.channel.id
     user_id = message.author.id
     key = (channel_id, user_id)
-    lock = conversation_locks.setdefault(key, asyncio.Lock())
+    conversation_lock = conversation_locks.setdefault(
+        key, asyncio.Lock()
+    )
 
     if command == "!reset":
-        async with lock:
+        async with conversation_lock:
             try:
                 await asyncio.to_thread(
                     clear_history,
@@ -86,51 +149,51 @@ async def on_message(message: discord.Message):
         return
 
     question = parts[1]
+    now = time.monotonic()
+    last_request = last_request_times.get(user_id)
 
-    async with lock:
-        try:
-            async with message.channel.typing():
-                history = await asyncio.to_thread(
-                    load_history,
-                    channel_id,
-                    user_id,
-                    limit=MAX_HISTORY_MESSAGES,
-                )
-
-                reply = await asyncio.to_thread(
-                    generate_reply,
-                    question,
-                    history=history,
-                )
-
-                reply = (reply or "").strip()
-                if not reply:
-                    await message.channel.send(
-                        "The model returned an empty response."
-                    )
-                    return
-
-                await asyncio.to_thread(
-                    save_turn,
-                    channel_id,
-                    user_id,
-                    question,
-                    reply,
-                    limit=MAX_HISTORY_MESSAGES,
-                )
-
-        except Exception as error:
-            print(
-                f"Request error: {type(error).__name__}: {error}",
-                flush=True,
-            )
+    if last_request is not None:
+        remaining = COOLDOWN_SECONDS - (now - last_request)
+        if remaining > 0:
             await message.channel.send(
-                "Sorry, I couldn't complete your request. Please try again."
+                f"Please wait {remaining:.1f} seconds "
+                "before asking another question."
             )
             return
 
-        for start in range(0, len(reply), 1900):
-            await message.channel.send(reply[start:start + 1900])
+    if pending_requests >= MAX_PENDING_REQUESTS:
+        await message.channel.send(
+            "I'm handling several requests right now. "
+            "Please try again shortly."
+        )
+        return
+
+    # Reserve a slot before any await lets another handler run.
+    requests_ahead = pending_requests
+    pending_requests += 1
+    last_request_times[user_id] = now
+
+    try:
+        # Preserve ordering between questions and resets.
+        async with conversation_lock:
+            if requests_ahead > 0:
+                await message.channel.send(
+                    "Your question has been accepted and is waiting "
+                    "for the current requests to finish."
+                )
+
+            async with processing_lock:
+                await answer_question(message, question)
+
+    except Exception as error:
+        print(
+            f"Discord handler error: {type(error).__name__}: {error}",
+            flush=True,
+        )
+
+    finally:
+        # Release the slot even if processing or sending fails.
+        pending_requests -= 1
 
 
 client.run(TOKEN)
