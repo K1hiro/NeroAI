@@ -1,8 +1,10 @@
 import asyncio
 import os
 import time
+from pathlib import Path
 
 import discord
+from discord import app_commands
 from dotenv import load_dotenv
 
 from llm_backend import MAX_HISTORY_MESSAGES, generate_reply
@@ -14,192 +16,253 @@ from memory_store import (
 )
 from rag_backend import generate_grounded_reply
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
 
-initialize_database()
+if not GUILD_ID or not GUILD_ID.isdigit():
+    raise RuntimeError("DISCORD_GUILD_ID must be a numeric server ID")
+
+TEST_GUILD = discord.Object(id=int(GUILD_ID))
 
 COOLDOWN_SECONDS = 10
 MAX_PENDING_REQUESTS = 5
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-client = discord.Client(
-    intents=intents,
-    allowed_mentions=discord.AllowedMentions.none(),
-)
+initialize_database()
 
 conversation_locks: dict[tuple[int, int], asyncio.Lock] = {}
 last_request_times: dict[int, float] = {}
-
 processing_lock = asyncio.Lock()
 pending_requests = 0
 
 
-@client.event
-async def on_ready():
-    print(f"Connected to Discord as {client.user}", flush=True)
+class NeroBot(discord.Client):
+    def __init__(self):
+        super().__init__(
+            intents=discord.Intents.default(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        self.tree = app_commands.CommandTree(self)
 
-
-async def answer_question(message, question, command):
-    channel_id = message.channel.id
-    user_id = message.author.id
-
-    try:
-        async with message.channel.typing():
-            if command == "!lookup":
-                reply = await asyncio.to_thread(
-                    generate_grounded_reply,
-                    question,
-                )
-            else:
-                history = await asyncio.to_thread(
-                    load_history,
-                    channel_id,
-                    user_id,
-                    limit=MAX_HISTORY_MESSAGES,
-                )
-
-                reply = await asyncio.to_thread(
-                    generate_reply,
-                    question,
-                    history=history,
-                )
-
-            reply = (reply or "").strip()
-            if not reply:
-                await message.channel.send(
-                    "The model returned an empty response."
-                )
-                return
-
-            # Only general chat is stored in conversation memory.
-            if command == "!ask":
-                await asyncio.to_thread(
-                    save_turn,
-                    channel_id,
-                    user_id,
-                    question,
-                    reply,
-                    limit=MAX_HISTORY_MESSAGES,
-                )
-
-    except Exception as error:
+    async def setup_hook(self):
+        commands = await self.tree.sync(guild=TEST_GUILD)
         print(
-            f"Request error: {type(error).__name__}: {error}",
+            f"Synced {len(commands)} slash commands "
+            f"to server {TEST_GUILD.id}",
             flush=True,
         )
-        await message.channel.send(
-            "Sorry, I couldn't complete your request. Please try again."
+
+    async def on_ready(self):
+        print(f"Connected to Discord as {self.user}", flush=True)
+
+
+client = NeroBot()
+
+
+def build_answer(channel_id, user_id, question, lookup):
+    """Run blocking model and database work in a worker thread."""
+    if lookup:
+        return generate_grounded_reply(question)
+
+    history = load_history(
+        channel_id,
+        user_id,
+        limit=MAX_HISTORY_MESSAGES,
+    )
+
+    reply = generate_reply(question, history=history)
+    reply = (reply or "").strip()
+
+    if reply:
+        save_turn(
+            channel_id,
+            user_id,
+            question,
+            reply,
+            limit=MAX_HISTORY_MESSAGES,
+        )
+
+    return reply
+
+
+async def send_answer(interaction, answer):
+    chunks = [
+        answer[start:start + 1900]
+        for start in range(0, len(answer), 1900)
+    ]
+
+    await interaction.edit_original_response(
+        content=chunks[0],
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    for chunk in chunks[1:]:
+        await interaction.followup.send(
+            chunk,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+async def handle_question(interaction, question, lookup=False):
+    global pending_requests
+
+    question = question.strip()
+
+    if not question:
+        await interaction.response.send_message(
+            "Please enter a question.",
+            ephemeral=True,
         )
         return
 
-    for start in range(0, len(reply), 1900):
-        await message.channel.send(reply[start:start + 1900])
-
-
-@client.event
-async def on_message(message: discord.Message):
-    global pending_requests
-
-    if message.author.bot:
+    if interaction.channel_id is None:
+        await interaction.response.send_message(
+            "Please use this command in a server channel.",
+            ephemeral=True,
+        )
         return
 
-    parts = message.content.strip().split(maxsplit=1)
-    if not parts:
-        return
-
-    command = parts[0].lower()
-    if command not in ("!ask", "!lookup", "!reset"):
-        return
-
-    channel_id = message.channel.id
-    user_id = message.author.id
-    key = (channel_id, user_id)
-    conversation_lock = conversation_locks.setdefault(
-        key, asyncio.Lock()
-    )
-
-    if command == "!reset":
-        async with conversation_lock:
-            try:
-                await asyncio.to_thread(
-                    clear_history,
-                    channel_id,
-                    user_id,
-                )
-            except Exception as error:
-                print(
-                    f"Reset error: {type(error).__name__}: {error}",
-                    flush=True,
-                )
-                await message.channel.send(
-                    "Sorry, I couldn't clear your memory. Please try again."
-                )
-                return
-
-            await message.channel.send(
-                "Your saved conversation memory in this channel "
-                "has been cleared."
-            )
-        return
-
-    if len(parts) < 2:
-        if command == "!lookup":
-            example = "!lookup What does IWAG stand for?"
-        else:
-            example = "!ask Explain overfitting in simple terms."
-
-        await message.channel.send(f"Try: {example}")
-        return
-
-    question = parts[1]
+    user_id = interaction.user.id
+    channel_id = interaction.channel_id
     now = time.monotonic()
     last_request = last_request_times.get(user_id)
 
     if last_request is not None:
         remaining = COOLDOWN_SECONDS - (now - last_request)
         if remaining > 0:
-            await message.channel.send(
+            await interaction.response.send_message(
                 f"Please wait {remaining:.1f} seconds "
-                "before asking another question."
+                "before asking another question.",
+                ephemeral=True,
             )
             return
 
     if pending_requests >= MAX_PENDING_REQUESTS:
-        await message.channel.send(
+        await interaction.response.send_message(
             "I'm handling several requests right now. "
-            "Please try again shortly."
+            "Please try again shortly.",
+            ephemeral=True,
         )
         return
 
+    key = (channel_id, user_id)
+    lock = conversation_locks.setdefault(key, asyncio.Lock())
+
+    # Reserve capacity before yielding to another command handler.
     requests_ahead = pending_requests
     pending_requests += 1
     last_request_times[user_id] = now
 
     try:
-        async with conversation_lock:
-            if requests_ahead > 0:
-                await message.channel.send(
-                    "Your question has been accepted and is waiting "
-                    "for the current requests to finish."
+        # Acknowledge immediately, before waiting or generating.
+        await interaction.response.defer(thinking=True)
+
+        if requests_ahead > 0:
+            await interaction.edit_original_response(
+                content="Your question is waiting for current requests."
+            )
+
+        async with lock:
+            async with processing_lock:
+                # Skip a request that waited beyond Discord's reply window.
+                if interaction.is_expired():
+                    return
+
+                reply = await asyncio.to_thread(
+                    build_answer,
+                    channel_id,
+                    user_id,
+                    question,
+                    lookup,
                 )
 
-            async with processing_lock:
-                await answer_question(message, question, command)
+                reply = (reply or "").strip()
+                if not reply:
+                    reply = "The model returned an empty response."
+
+                await send_answer(interaction, reply)
 
     except Exception as error:
         print(
-            f"Discord handler error: {type(error).__name__}: {error}",
+            f"Request error: {type(error).__name__}: {error}",
             flush=True,
         )
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(
+                    content="Sorry, I couldn't complete your request."
+                )
+            else:
+                await interaction.response.send_message(
+                    "Sorry, I couldn't complete your request.",
+                    ephemeral=True,
+                )
+        except discord.HTTPException:
+            pass
 
     finally:
         pending_requests -= 1
 
 
-client.run(TOKEN)
+@client.tree.command(
+    name="ask",
+    description="Chat with NeroAI using your saved conversation memory.",
+    guild=TEST_GUILD,
+)
+@app_commands.describe(question="What would you like to ask?")
+async def ask(interaction: discord.Interaction, question: str):
+    await handle_question(interaction, question)
+
+
+@client.tree.command(
+    name="lookup",
+    description="Search NeroAI's knowledge files and answer with sources.",
+    guild=TEST_GUILD,
+)
+@app_commands.describe(question="Include the topic you want to look up.")
+async def lookup(interaction: discord.Interaction, question: str):
+    await handle_question(interaction, question, lookup=True)
+
+
+@client.tree.command(
+    name="reset",
+    description="Clear your saved conversation memory in this channel.",
+    guild=TEST_GUILD,
+)
+async def reset(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.channel_id is None:
+        await interaction.edit_original_response(
+            content="Please use this command in a server channel."
+        )
+        return
+
+    key = (interaction.channel_id, interaction.user.id)
+    lock = conversation_locks.setdefault(key, asyncio.Lock())
+
+    try:
+        async with lock:
+            await asyncio.to_thread(clear_history, *key)
+
+        await interaction.edit_original_response(
+            content="Your saved conversation memory "
+            "in this channel has been cleared."
+        )
+
+    except Exception as error:
+        print(
+            f"Reset error: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        await interaction.edit_original_response(
+            content="Sorry, I couldn't clear your memory. Please try again."
+        )
+
+
+if __name__ == "__main__":
+    client.run(TOKEN)
