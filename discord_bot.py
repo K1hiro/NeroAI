@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-
+from moderation_commands import register_moderation_commands
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -265,4 +265,5 @@ async def reset(interaction: discord.Interaction):
 
 
 if __name__ == "__main__":
+    register_moderation_commands(client.tree, TEST_GUILD)
     client.run(TOKEN)
