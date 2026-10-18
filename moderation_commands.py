@@ -9,6 +9,13 @@ from moderation_store import (
     record_warning,
 )
 
+PERMISSIONS = {
+    "warn": ("moderate_members", "Moderate Members"),
+    "mute": ("moderate_members", "Moderate Members"),
+    "kick": ("kick_members", "Kick Members"),
+    "ban": ("ban_members", "Ban Members"),
+}
+
 
 async def respond(interaction, text):
     await interaction.edit_original_response(
@@ -17,33 +24,14 @@ async def respond(interaction, text):
     )
 
 
-async def validate_reason(interaction, reason, maximum):
-    reason = reason.strip()
-
-    if not 1 <= len(reason) <= maximum:
-        await respond(
-            interaction,
-            f"Please enter a reason between 1 and {maximum} characters.",
-        )
-        return None
-
-    return reason
-
-
 async def check_target(interaction, member, action):
-    """Verify the moderator and target using current membership data."""
     server = interaction.guild
 
     if server is None:
         await respond(interaction, "This command must be used in a server.")
         return None
 
-    permission = (
-        "kick_members" if action == "kick" else "moderate_members"
-    )
-    permission_name = (
-        "Kick Members" if action == "kick" else "Moderate Members"
-    )
+    permission, permission_name = PERMISSIONS[action]
 
     try:
         moderator = await server.fetch_member(interaction.user.id)
@@ -91,12 +79,7 @@ async def check_target(interaction, member, action):
 
 
 async def check_bot_permissions(interaction, target, action):
-    permission = (
-        "kick_members" if action == "kick" else "moderate_members"
-    )
-    permission_name = (
-        "Kick Members" if action == "kick" else "Moderate Members"
-    )
+    permission, permission_name = PERMISSIONS[action]
 
     try:
         bot_member = await interaction.guild.fetch_member(
@@ -126,37 +109,29 @@ async def check_bot_permissions(interaction, target, action):
     return True
 
 
-def register_moderation_commands(tree, guild):
-    initialize_warning_database()
+async def handle_moderation(
+    interaction, member, reason, action, minutes=None
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    @tree.command(
-        name="warn",
-        description="Record a moderation warning for a server member.",
-        guild=guild,
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(moderate_members=True)
-    @app_commands.describe(
-        member="The member receiving the warning.",
-        reason="Why this warning is being recorded (up to 500 characters).",
-    )
-    async def warn(
-        interaction: discord.Interaction,
-        member: discord.Member,
-        reason: str,
-    ):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+    reason = reason.strip()
+    maximum = 500 if action == "warn" else 400
 
-        reason = await validate_reason(interaction, reason, 500)
-        if reason is None:
-            return
+    if not 1 <= len(reason) <= maximum:
+        await respond(
+            interaction,
+            f"Please enter a reason between 1 and {maximum} characters.",
+        )
+        return
 
-        checked = await check_target(interaction, member, "warn")
-        if checked is None:
-            return
+    checked = await check_target(interaction, member, action)
+    if checked is None:
+        return
 
-        moderator, target = checked
+    moderator, target = checked
+    safe_reason = discord.utils.escape_markdown(reason)
 
+    if action == "warn":
         try:
             warning_id = await asyncio.to_thread(
                 record_warning,
@@ -176,14 +151,111 @@ def register_moderation_commands(tree, guild):
             )
             return
 
-        safe_reason = discord.utils.escape_markdown(reason)
-
         await respond(
             interaction,
             f"Warning #{warning_id} recorded for member {target.id}.\n"
             f"Reason: {safe_reason}\n\n"
             "The member has not been automatically notified.",
         )
+        return
+
+    if action == "mute":
+        if target.guild_permissions.administrator:
+            await respond(
+                interaction,
+                "Discord does not allow timeouts on administrators.",
+            )
+            return
+
+        if target.is_timed_out():
+            await respond(
+                interaction,
+                "This member already has an active timeout.",
+            )
+            return
+
+    if not await check_bot_permissions(interaction, target, action):
+        return
+
+    audit_reason = f"Moderator {moderator.id}: {reason}"
+
+    try:
+        if action == "mute":
+            await target.timeout(
+                timedelta(minutes=minutes),
+                reason=audit_reason,
+            )
+            result = (
+                f"Member {target.id} timed out for {minutes} minute(s)."
+            )
+
+        elif action == "kick":
+            await target.kick(reason=audit_reason)
+            result = f"Member {target.id} was kicked from the server."
+
+        elif action == "ban":
+            await target.ban(
+                reason=audit_reason,
+                delete_message_seconds=0,
+            )
+            result = (
+                f"Member {target.id} was banned from the server.\n"
+                "Existing message history was preserved."
+            )
+
+        else:
+            raise ValueError(f"Unsupported moderation action: {action}")
+
+    except discord.NotFound:
+        await respond(
+            interaction,
+            "Discord could not find the target. Check the member's status.",
+        )
+        return
+
+    except discord.Forbidden:
+        await respond(
+            interaction,
+            f"Discord denied the {action}. Check my permissions "
+            "and role position.",
+        )
+        return
+
+    except discord.HTTPException as error:
+        print(f"{action} request error: {error}", flush=True)
+        await respond(
+            interaction,
+            f"I couldn't confirm the {action}. Check the member's status "
+            "and server audit log before trying again.",
+        )
+        return
+
+    await respond(
+        interaction,
+        f"{result}\nReason: {safe_reason}",
+    )
+
+
+def register_moderation_commands(tree, guild):
+    initialize_warning_database()
+
+    @tree.command(
+        name="warn",
+        description="Record a moderation warning for a server member.",
+        guild=guild,
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.describe(
+        member="The member receiving the warning.",
+        reason="Reason for the warning (up to 500 characters).",
+    )
+    async def warn(
+        interaction: discord.Interaction,
+        member: discord.Member,
+        reason: str,
+    ):
+        await handle_moderation(interaction, member, reason, "warn")
 
     @tree.command(
         name="mute",
@@ -203,62 +275,8 @@ def register_moderation_commands(tree, guild):
         minutes: app_commands.Range[int, 1, 40320],
         reason: str,
     ):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        reason = await validate_reason(interaction, reason, 400)
-        if reason is None:
-            return
-
-        checked = await check_target(interaction, member, "mute")
-        if checked is None:
-            return
-
-        moderator, target = checked
-
-        if target.guild_permissions.administrator:
-            await respond(
-                interaction,
-                "Discord does not allow timeouts on administrators.",
-            )
-            return
-
-        if not await check_bot_permissions(interaction, target, "mute"):
-            return
-
-        if target.is_timed_out():
-            await respond(
-                interaction,
-                "This member already has an active timeout.",
-            )
-            return
-
-        try:
-            await target.timeout(
-                timedelta(minutes=minutes),
-                reason=f"Moderator {moderator.id}: {reason}",
-            )
-        except discord.Forbidden:
-            await respond(
-                interaction,
-                "Discord denied the timeout. Check my permissions "
-                "and role position.",
-            )
-            return
-        except discord.HTTPException as error:
-            print(f"Timeout request error: {error}", flush=True)
-            await respond(
-                interaction,
-                "I couldn't confirm the timeout. Check the member's "
-                "status before trying again.",
-            )
-            return
-
-        safe_reason = discord.utils.escape_markdown(reason)
-
-        await respond(
-            interaction,
-            f"Member {target.id} timed out for {minutes} minute(s).\n"
-            f"Reason: {safe_reason}",
+        await handle_moderation(
+            interaction, member, reason, "mute", minutes=minutes
         )
 
     @tree.command(
@@ -277,51 +295,22 @@ def register_moderation_commands(tree, guild):
         member: discord.Member,
         reason: str,
     ):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await handle_moderation(interaction, member, reason, "kick")
 
-        reason = await validate_reason(interaction, reason, 400)
-        if reason is None:
-            return
-
-        checked = await check_target(interaction, member, "kick")
-        if checked is None:
-            return
-
-        moderator, target = checked
-
-        if not await check_bot_permissions(interaction, target, "kick"):
-            return
-
-        try:
-            await target.kick(
-                reason=f"Moderator {moderator.id}: {reason}",
-            )
-        except discord.NotFound:
-            await respond(
-                interaction,
-                "This member is no longer in the server.",
-            )
-            return
-        except discord.Forbidden:
-            await respond(
-                interaction,
-                "Discord denied the kick. Check my permissions "
-                "and role position.",
-            )
-            return
-        except discord.HTTPException as error:
-            print(f"Kick request error: {error}", flush=True)
-            await respond(
-                interaction,
-                "I couldn't confirm the kick. Check the member list "
-                "before trying again.",
-            )
-            return
-
-        safe_reason = discord.utils.escape_markdown(reason)
-
-        await respond(
-            interaction,
-            f"Member {target.id} was kicked from the server.\n"
-            f"Reason: {safe_reason}",
-        )
+    @tree.command(
+        name="ban",
+        description="Ban a server member while preserving message history.",
+        guild=guild,
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(ban_members=True)
+    @app_commands.describe(
+        member="The member to ban from the server.",
+        reason="Reason for the ban (up to 400 characters).",
+    )
+    async def ban(
+        interaction: discord.Interaction,
+        member: discord.Member,
+        reason: str,
+    ):
+        await handle_moderation(interaction, member, reason, "ban")
